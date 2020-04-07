@@ -8,6 +8,71 @@ import numpy as np
 import cv2
 
 
+def unique(indices):
+    """Get classes present in any given image, since there can be multiple tru detections of the same class.
+
+    Parameter:
+        indices (tensor): the indices of max values of different bboxes.
+
+    Returns:
+        indices_res (tensor): the indices of the unique max values of different bboxes.
+
+    Example:
+        indices = tensor([0, 0, 1])
+        indices_res = tensor([0, 1])
+    """
+    indices_np = indices.cpu().numpy()
+    unique_np = np.unique(indices_np)
+    unique_indices = torch.from_numpy(unique_np)
+
+    indices_res = unique_indices.detach().clone()
+    return indices_res
+
+
+def bbox_iou(box1, box2):
+    """Calculates the IoU of two bounding boxes.
+
+    Args:
+        box1 (2D tensor): bounding box 1
+        box2 (2D tensor): bounding box 2
+
+    Returns:
+        iou (2D tensor): IoU of the boxes
+    # """
+    inter_max_xy = torch.min(box1[:, 2:4], box2[:, 2:4])
+    inter_min_xy = torch.max(box1[:, 0:2], box2[:, 0:2])
+
+    inter_size = torch.clamp((inter_max_xy-inter_min_xy), min=0)
+    inter_area = inter_size[:, 0]*inter_size[:, 1]  # 1 by num_boxes
+
+    # # Original codes
+    # # Get the coordinates of bounding boxes
+    # b1_x1, b1_y1, b1_x2, b1_y2 = box1[:, 0], box1[:, 1], box1[:, 2], box1[:, 3]
+    # b2_x1, b2_y1, b2_x2, b2_y2 = box2[:, 0], box2[:, 1], box2[:, 2], box2[:, 3]
+
+    # # Get the coordinates of the intersection rectangle
+    # # Can take multi-row tensors
+    # inter_rect_x1 = torch.max(b1_x1, b2_x1)
+    # inter_rect_y1 = torch.max(b1_y1, b2_y1)
+    # inter_rect_x2 = torch.min(b1_x2, b2_x2)
+    # inter_rect_y2 = torch.min(b1_y2, b2_y2)
+
+    # # Intersection area
+    # inter_area = torch.clamp(inter_rect_x2 - inter_rect_x1 + 1, min=0) * \
+    #     torch.clamp(inter_rect_y2 - inter_rect_y1 + 1, min=0)
+
+    # # Union Area
+    # b1_area = (b1_x2 - b1_x1 + 1)*(b1_y2 - b1_y1 + 1)
+    # b2_area = (b2_x2 - b2_x1 + 1)*(b2_y2 - b2_y1 + 1)
+
+    b1_area = (box1[:, 2]-box1[:, 0])*(box1[:, 3]-box1[:, 1])
+    b2_area = (box2[:, 2]-box2[:, 0])*(box2[:, 3]-box2[:, 1])
+
+    iou = inter_area / (b1_area + b2_area - inter_area)
+
+    return iou
+
+
 def predict_transform(prediction, input_dim, anchors, num_classes, CUDA=True):
     """Takes an detection feature map and turns it into a 2D tensor, where each row of the tensor corresponds to attributes of a bounding box. The 2D tensor is like:
 
@@ -24,7 +89,7 @@ def predict_transform(prediction, input_dim, anchors, num_classes, CUDA=True):
     3rd BBox        ->  (bs-1, [gs-1][gs-1]2, 5+num_classes)
 
 
-    Parameters:
+    Args:
         prediction (tensor): previous output
         input_dim (int): input image dimension
         anchors (list(tuple)): used anchors in this yolo layer
@@ -97,3 +162,130 @@ def predict_transform(prediction, input_dim, anchors, num_classes, CUDA=True):
     prediction[:, :, :4] *= stride
 
     return prediction
+
+
+def write_results(prediction, confidence, num_classes, nms_conf=0.4):
+    """To obtain the true detections via subjecting the output to objectness score thresholding and Non-Maximum Suppression.
+
+    Args:
+        prediction (tensor):    Prediction table of bboxes
+        confidence ():          Obejctness score threshold
+        num_classes (int):      Would be 80 in COCO case
+        nms_conf (float):       The NMS IoU threshold
+
+    Returns:
+        output (tensor):        Shape (D * 8), where D is the number of true detections in all of images, each presented by a row. Each detection has 8 attributes, anemly, index of the image in the batch to which the detection belongs to, 4 corner coordinates, objectness score, the score of the class with maximum confidence, and the index of the class.
+    """
+    # 1. Objectness confidence thresholding
+    # < threshold   ->  all zeros in this bbox
+    conf_mask = (prediction[:, :, 4] > confidence).float(
+    ).unsqueeze(2)  # Same number of dims as prediction
+    prediction *= conf_mask
+
+    # 2. Localise the left-top and right-bottom corners
+    box_corner = prediction.detach().clone()
+    box_corner[:, :, 0] = (prediction[:, :, 0] - prediction[:, :, 2]/2)
+    box_corner[:, :, 1] = (prediction[:, :, 1] - prediction[:, :, 3]/2)
+    box_corner[:, :, 2] = (prediction[:, :, 0] + prediction[:, :, 2]/2)
+    box_corner[:, :, 3] = (prediction[:, :, 1] + prediction[:, :, 3]/2)
+    prediction[:, :, :4] = box_corner[:, :, :4]
+
+    batch_size = prediction.size(0)
+    write = False   # output not initialised
+
+    # 3. Loop over images of the batch
+    for ib in range(batch_size):
+        image_prediction = prediction[ib]    # Only 2D tensor now
+
+        # 3.1. Confidence thresholding
+        # Only concerned with the class score having the maximum value
+        # Remove the 80 class scored from each row, and instead add the
+        # index of the class having the maximum values, as well as the score.
+
+        max_conf, max_conf_indices = torch.max(
+            image_prediction[:, 5:5+num_classes], 1)
+        max_conf = max_conf.float().unsqueeze(1)    # .float() might be removed
+        max_conf_indices = max_conf_indices.float().unsqueeze(1)
+        image_prediction = torch.cat(
+            (image_prediction[:, :5], max_conf, max_conf_indices), 1)
+
+        # Get rid of rows with zero objectness
+        non_zero_indices = torch.nonzero(image_prediction[:, 4]).squeeze()
+        image_prediction_ = image_prediction[non_zero_indices, :]
+
+        if image_prediction_.shape[0] == 0:
+            continue    # End current iteration, move to the nest image
+
+        # # Original codes--------------
+        # non_zero_ind = (torch.nonzero(image_pred[:, 4]))
+        # try:
+        #     image_pred_ = image_pred[non_zero_ind.squeeze(), :].view(-1, 7)
+        # except:
+        #     continue
+
+        # # For PyTorch 0.4 compatibility
+        # # Since the above code with not raise exception for no detection
+        # # as scalars are supported in PyTorch 0.4
+        # if image_pred_.shape[0] == 0:
+        #     continue
+        # # ------------
+
+        # Get the various classes detected in the image
+        img_classes = unique(image_prediction_[:, -1])
+
+        # 3.2. Classwise NMS
+        for cls in img_classes:
+            # 3.2.1 Get detections assigned to the current class
+            cls_mask = image_prediction_ * \
+                (image_prediction_[:, -1] == cls).float().unsqueeze(1)
+            cls_mask_indices = torch.nonzero(cls_mask[:, -2]).squeeze()
+            img_pred_classes = image_prediction_[
+                cls_mask_indices].view(-1, 7)  # The bboxes with the same class
+
+            # 3.2.2 Sort the detections in the sequence of objectness score from highest on the top to the lowest on the bottom
+            obj_conf_desc_indices = torch.sort(
+                img_pred_classes[:, 4], descending=True)[1]
+            img_pred_classes = img_pred_classes[obj_conf_desc_indices]
+            num_detections = img_pred_classes.size(0)
+
+            # 3.2.3 NMS
+            for i in range(num_detections):
+                # Get the IoUs of all boxes below the one that we are looing at
+                try:
+                    ious = bbox_iou(img_pred_classes[i].unsqueeze(
+                        0), img_pred_classes[i+1:])
+                except ValueError:
+                    break   # second input param -> empty tensor
+                except IndexError:
+                    break   # index out of bound
+
+                # Zero out all the detections that have IoU > threshold, i.e. similar to the top box
+                iou_mask = (ious < nms_conf).float().unsqueeze(1)
+                img_pred_classes[i+1:] *= iou_mask
+
+                # Keep the non-zero rows, including bboxes that are very distinct from the top one
+                non_zero_indices = torch.nonzero(
+                    img_pred_classes[:, 4]).squeeze()
+                img_pred_classes = img_pred_classes[non_zero_indices].view(
+                    -1, 7)
+
+            # 3.2.4 Writing the predictions
+            # e.g. for batch with index: i, having k detections, the batch_indices will be a k-by-1 tensor filled with i.
+            batch_indices = img_pred_classes.new_full(
+                (img_pred_classes.size(0), 1), ib)
+            # Original:
+            # batch_indices = img_pred_classes.new(img_pred_classes.size(0), 1).fill_(ib)
+            seq = batch_indices, img_pred_classes   # tuple
+
+            # Detections concatenation
+            if not write:
+                output = torch.cat(seq, 1)
+                write = True
+            else:
+                new_out = torch.cat(seq, 1)
+                output = torch.cat((output, new_out))
+
+    try:
+        return output
+    except:
+        return 0    # Not a single detection in the batch

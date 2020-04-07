@@ -243,6 +243,89 @@ class Darknet(nn.Module):
 
         return detections
 
+    def load_weights(self, weight_file):
+        # Open the weights file
+        fp = open(weight_file, 'rb')
+
+        # The first 5 values are header information
+        #   5 in32 according to https://github.com/ultralytics/yolov3/commit/d7a28bd9f74d922216e06de3dde5f981b3002bd4
+        #   but 3 int32 & 1 int64 according to https://github.com/AlexeyAB/darknet/issues/2914#issuecomment-496675346)
+        #   1.      Major version number
+        #   2.      Minor version number
+        #   3.      Subversion number
+        #   4,5.    Images seen by the network (during training)
+        header = np.fromfile(fp, dtype=np.int32, count=5)
+        self.header = torch.from_numpy(header)
+        self.seen = self.header[3]
+
+        weights = np.fromfile(fp, dtype=np.float32)
+
+        ptr = 0  # Keep track of where we are in the weights array
+        for i in range(len(self.module_list)):
+            module_type = self.blocks[i+1]['type']
+
+            # If module_type is convolutional then load weights, otherwise ignore
+            if module_type == 'convolutional':
+                model = self.module_list[i]
+                try:
+                    batch_normalize = int(self.blocks[i+1]['batch_normalize'])
+                except:
+                    batch_normalize = 0
+                conv = model[0]
+
+                if (batch_normalize):
+                    # https://github.com/pytorch/pytorch/issues/16149
+                    bn = model[1]
+                    # Number of weights of batch norm layer
+                    num_bn_biases = bn.bias.numel()
+                    # Load the weights
+                    bn_biases = torch.from_numpy(
+                        weights[ptr:ptr+num_bn_biases])
+                    ptr += num_bn_biases
+
+                    bn_weights = torch.from_numpy(
+                        weights[ptr:ptr+num_bn_biases])
+                    ptr += num_bn_biases
+
+                    bn_running_mean = torch.from_numpy(
+                        weights[ptr:ptr+num_bn_biases])
+                    ptr += num_bn_biases
+
+                    bn_running_var = torch.from_numpy(
+                        weights[ptr:ptr+num_bn_biases])
+                    ptr += num_bn_biases
+
+                    # Cast the loaded weights into dims of model weights
+                    bn_biases = bn_biases.view_as(bn.bias.data)
+                    bn_weights = bn_weights.view_as(bn.weight.data)
+                    bn_running_mean = bn_running_mean.view_as(bn.running_mean)
+                    bn_running_var = bn_running_var.view_as(bn.running_var)
+
+                    # Copy the data to model
+                    bn.bias.data.copy_(bn_biases)
+                    bn.weight.data.copy_(bn_weights)
+                    bn.running_mean.copy_(bn_running_mean)
+                    bn.running_var.copy_(bn_running_var)
+                else:
+                    num_biases = conv.bias.numel()
+
+                    # Load the weights
+                    conv_biases = torch.from_numpy(weights[ptr:ptr+num_biases])
+                    ptr += num_biases
+
+                    # Reshape the loaded weights according to the dimension of the model weights
+                    conv_biases = conv_biases.view_as(conv.bias.data)
+
+                    conv.bias.data.copy_(conv_biases)
+
+                # Load the weights of the convlolutional layer (same for non-bn or bn)
+                num_weights = conv.weight.numel()
+                conv_weights = torch.from_numpy(weights[ptr:ptr+num_weights])
+                ptr += num_weights
+
+                conv_weights = conv_weights.view_as(conv.weight.data)
+                conv.weight.data.copy_(conv_weights)
+
 
 # Test the creation
 if __name__ == '__main__':
@@ -253,6 +336,7 @@ if __name__ == '__main__':
 
     # Given an image, implement the forward pass once to get the prediction table
     model = Darknet('cfg/yolov3.cfg')
+    model.load_weights('weights/yolov3.weights')
     inp = get_test_input()
     pred = model(inp, torch.cuda.is_available())
     print(pred.size())
