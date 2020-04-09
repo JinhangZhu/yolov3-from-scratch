@@ -211,7 +211,7 @@ def write_results(prediction, confidence, num_classes, nms_conf=0.4):
 
         # Get rid of rows with zero objectness
         non_zero_indices = torch.nonzero(image_prediction[:, 4]).squeeze()
-        image_prediction_ = image_prediction[non_zero_indices, :]
+        image_prediction_ = image_prediction[non_zero_indices, :].view(-1, 7)
 
         if image_prediction_.shape[0] == 0:
             continue    # End current iteration, move to the nest image
@@ -289,3 +289,60 @@ def write_results(prediction, confidence, num_classes, nms_conf=0.4):
         return output
     except:
         return 0    # Not a single detection in the batch
+
+
+def load_classes(namesfile):
+    """Load the classes.name file.
+
+    Args:
+        namefile (string): namesfile path.
+
+    Returns:
+        names (list): A list of class names.
+    """
+    fp = open(namesfile, 'r')
+    names = fp.read().split('\n')[:-1]
+    return names
+
+
+def letterbox_image(source, input_dim):
+    """Resize image with unchanged aspect ratio using padding.
+
+    Args:
+        source (numpy array): The source image.
+        input_dim (tuple): (height, width) of the input image of the model.
+
+    Returns:
+        canvas (numpy array): The resized image with unchanged ratio.
+    """
+    src_height, src_width = source.shape[0], source.shape[1]
+    input_height, input_width = input_dim
+    multiple = min(input_height/src_height, input_width/src_width)
+    dst_height = int(src_height * multiple)
+    dst_width = int(src_width*multiple)
+    resized_image = cv2.resize(
+        source, (dst_width, dst_height), interpolation=cv2.INTER_CUBIC)
+
+    canvas = np.full((input_height, input_width, 3), 128)
+    canvas[(input_height-dst_height)//2:(input_height-dst_height)//2 + dst_height,
+           (input_width-dst_width)//2: (input_width-dst_width)//2 + dst_width, :] = resized_image
+
+    return canvas
+
+
+def prep_image(img, input_dim):
+    """Prepare image for inputting to the neural network. Transforming from numpy to tensor.
+
+    Args:
+        img (numpy array): The numpy array image.
+        input_dim (int): (height, width) of the input image of the model.
+
+    Returns:
+        img (tensor): Image in tensor type.
+    """
+    img = (letterbox_image(img, (input_dim, input_dim)))
+    # BGR -> RGB, HWC -> CHW
+    img = img[:, :, :: -1].transpose((2, 0, 1)).copy()
+    # numpy -> tensor, normalise, CHW -> BCHW
+    img = torch.from_numpy(img).float().div(255).unsqueeze(0)
+    return img
