@@ -160,6 +160,7 @@ def predict_transform(prediction, input_dim, anchors, num_classes, CUDA=True):
 
     # Resize the prediction map to the size of the imput image
     prediction[:, :, :4] *= stride
+    print("Predictions: ", prediction)
 
     return prediction
 

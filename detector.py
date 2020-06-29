@@ -158,7 +158,7 @@ if __name__ == '__main__':
             batch = batch.cuda()
         with torch.no_grad():   # This is not training
             prediction = model(batch, CUDA)
-
+        
         prediction = write_results(
             prediction=prediction,
             confidence=confidence,
